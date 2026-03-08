@@ -10,6 +10,9 @@ import torch.nn.functional as F
 from tqdm import tqdm, trange
 
 import matplotlib.pyplot as plt
+import swanlab
+from pytorch_msssim import ssim as compute_ssim
+import lpips
 
 from run_nerf_helpers import *
 
@@ -460,7 +463,7 @@ def config_parser():
     # rendering options
     parser.add_argument("--N_samples", type=int, default=64, 
                         help='number of coarse samples per ray')
-    parser.add_argument("--N_importance", type=int, default=0,
+    parser.add_argument("--N_importance", type=int, default=128,
                         help='number of additional fine samples per ray')
     parser.add_argument("--perturb", type=float, default=1.,
                         help='set to 0. for no jitter, 1. for jitter')
@@ -517,6 +520,8 @@ def config_parser():
                         help='will take every 1/N images as LLFF test set, paper uses 8')
 
     # logging/saving options
+    parser.add_argument("--N_iters",    type=int, default=200001,
+                        help='total number of training iterations')
     parser.add_argument("--i_print",   type=int, default=100, 
                         help='frequency of console printout and metric loggin')
     parser.add_argument("--i_img",     type=int, default=500, 
@@ -640,6 +645,35 @@ def train():
     render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer = create_nerf(args)
     global_step = start
 
+    # Initialize LPIPS model
+    lpips_fn = lpips.LPIPS(net='vgg').to(device)
+
+    # Initialize SwanLab
+    swanlab.init(
+        project="NeRF-PyTorch",
+        experiment_name=args.expname,
+        config={
+            "learning_rate": args.lrate,
+            "lrate_decay": args.lrate_decay,
+            "max_iterations": 200001,
+            "batch_size": args.N_rand,
+            "N_samples": args.N_samples,
+            "N_importance": args.N_importance,
+            "netdepth": args.netdepth,
+            "netwidth": args.netwidth,
+            "netdepth_fine": args.netdepth_fine,
+            "netwidth_fine": args.netwidth_fine,
+            "use_viewdirs": args.use_viewdirs,
+            "dataset_type": args.dataset_type,
+            "datadir": args.datadir,
+            "half_res": args.half_res,
+            "white_bkgd": args.white_bkgd,
+            "precrop_iters": args.precrop_iters,
+            "precrop_frac": args.precrop_frac,
+            "total_params": sum(p.numel() for p in grad_vars),
+        },
+    )
+
     bds_dict = {
         'near' : near,
         'far' : far,
@@ -698,7 +732,7 @@ def train():
         rays_rgb = torch.Tensor(rays_rgb).to(device)
 
 
-    N_iters = 200000 + 1
+    N_iters = args.N_iters
     print('Begin')
     print('TRAIN views are', i_train)
     print('TEST views are', i_test)
@@ -823,53 +857,121 @@ def train():
                 render_path(torch.Tensor(poses[i_test]).to(device), hwf, K, args.chunk, render_kwargs_test, gt_imgs=images[i_test], savedir=testsavedir)
             print('Saved test set')
 
+        # --- Render fixed test view every 1K steps (round-robin first 5 test poses) ---
+        if i % 1000 == 0 and i > 0:
+            n_test_views = min(5, len(i_test))
+            test_idx = (i // 1000) % n_test_views  # round-robin 0,1,2,3,4,0,1,...
+            test_img_idx = i_test[test_idx]
+
+            target_test = images[test_img_idx]
+            if not torch.is_tensor(target_test):
+                target_test = torch.Tensor(target_test).to(device)
+            pose_test = poses[test_img_idx, :3, :4]
+
+            with torch.no_grad():
+                rgb_test, disp_test, acc_test, _ = render(
+                    H, W, K, chunk=args.chunk, c2w=pose_test, **render_kwargs_test
+                )
+
+            # Compute metrics
+            test_mse = img2mse(rgb_test, target_test)
+            test_psnr = mse2psnr(test_mse)
+            rgb_ts = rgb_test.permute(2, 0, 1).unsqueeze(0).clamp(0, 1)
+            target_ts = target_test.permute(2, 0, 1).unsqueeze(0).clamp(0, 1)
+            test_ssim = compute_ssim(rgb_ts, target_ts, data_range=1.0)
+            with torch.no_grad():
+                test_lpips = lpips_fn(rgb_ts * 2 - 1, target_ts * 2 - 1).item()
+
+            # Save image locally
+            test_render_dir = os.path.join(basedir, expname, 'test_renders')
+            os.makedirs(test_render_dir, exist_ok=True)
+            rgb_test_np = to8b(rgb_test.cpu().numpy())
+            imageio.imwrite(os.path.join(test_render_dir, f'iter{i:06d}_view{test_idx}.png'), rgb_test_np)
+
+            # Log to SwanLab
+            swanlab.log({
+                "test_render/psnr": test_psnr.item(),
+                "test_render/ssim": test_ssim.item(),
+                "test_render/lpips": test_lpips,
+                "test_render/rgb": swanlab.Image(
+                    rgb_test_np, caption=f"test_view_{test_idx}_iter{i}"
+                ),
+            }, step=i)
+
+            tqdm.write(
+                f"[TEST RENDER] Iter: {i} View: {test_idx}  "
+                f"PSNR: {test_psnr.item():.2f}  "
+                f"SSIM: {test_ssim.item():.4f}  "
+                f"LPIPS: {test_lpips:.4f}"
+            )
+
 
     
         if i%args.i_print==0:
-            tqdm.write(f"[TRAIN] Iter: {i} Loss: {loss.item()}  PSNR: {psnr.item()}")
-        """
-            print(expname, i, psnr.numpy(), loss.numpy(), global_step.numpy())
-            print('iter time {:.05f}'.format(dt))
+            # --- Compute current learning rate ---
+            decay_rate_val = 0.1
+            decay_steps_val = args.lrate_decay * 1000
+            current_lr = args.lrate * (decay_rate_val ** (global_step / decay_steps_val))
 
-            with tf.contrib.summary.record_summaries_every_n_global_steps(args.i_print):
-                tf.contrib.summary.scalar('loss', loss)
-                tf.contrib.summary.scalar('psnr', psnr)
-                tf.contrib.summary.histogram('tran', trans)
-                if args.N_importance > 0:
-                    tf.contrib.summary.scalar('psnr0', psnr0)
+            # --- Log training metrics ---
+            log_dict = {
+                "train/loss": loss.item(),
+                "train/psnr": psnr.item(),
+                "train/lr": current_lr,
+                "train/iter_time": dt,
+            }
 
+            # --- Render a validation view and compute PSNR / SSIM / LPIPS ---
+            img_i = np.random.choice(i_val)
+            target_val = images[img_i]
+            if not torch.is_tensor(target_val):
+                target_val = torch.Tensor(target_val).to(device)
+            pose_val = poses[img_i, :3, :4]
 
-            if i%args.i_img==0:
+            with torch.no_grad():
+                rgb_val, disp_val, acc_val, _ = render(
+                    H, W, K, chunk=args.chunk, c2w=pose_val, **render_kwargs_test
+                )
 
-                # Log a rendered validation view to Tensorboard
-                img_i=np.random.choice(i_val)
-                target = images[img_i]
-                pose = poses[img_i, :3,:4]
-                with torch.no_grad():
-                    rgb, disp, acc, extras = render(H, W, focal, chunk=args.chunk, c2w=pose,
-                                                        **render_kwargs_test)
+            # PSNR
+            val_mse = img2mse(rgb_val, target_val)
+            val_psnr = mse2psnr(val_mse)
 
-                psnr = mse2psnr(img2mse(rgb, target))
+            # SSIM  (needs [1, C, H, W] in [0, 1])
+            rgb_s = rgb_val.permute(2, 0, 1).unsqueeze(0).clamp(0, 1)
+            target_s = target_val.permute(2, 0, 1).unsqueeze(0).clamp(0, 1)
+            val_ssim = compute_ssim(rgb_s, target_s, data_range=1.0)
 
-                with tf.contrib.summary.record_summaries_every_n_global_steps(args.i_img):
+            # LPIPS (needs [1, C, H, W] in [-1, 1])
+            rgb_l = rgb_s * 2 - 1
+            target_l = target_s * 2 - 1
+            with torch.no_grad():
+                val_lpips = lpips_fn(rgb_l, target_l).item()
 
-                    tf.contrib.summary.image('rgb', to8b(rgb)[tf.newaxis])
-                    tf.contrib.summary.image('disp', disp[tf.newaxis,...,tf.newaxis])
-                    tf.contrib.summary.image('acc', acc[tf.newaxis,...,tf.newaxis])
+            log_dict["val/psnr"] = val_psnr.item()
+            log_dict["val/ssim"] = val_ssim.item()
+            log_dict["val/lpips"] = val_lpips
 
-                    tf.contrib.summary.scalar('psnr_holdout', psnr)
-                    tf.contrib.summary.image('rgb_holdout', target[tf.newaxis])
+            # Log rendered image every 500 steps to avoid too many images
+            if i % args.i_img == 0:
+                rgb_np = to8b(rgb_val.cpu().numpy())
+                log_dict["val/rgb_rendered"] = swanlab.Image(
+                    rgb_np, caption=f"val_view_{img_i}_iter{i}"
+                )
 
+            swanlab.log(log_dict, step=i)
 
-                if args.N_importance > 0:
-
-                    with tf.contrib.summary.record_summaries_every_n_global_steps(args.i_img):
-                        tf.contrib.summary.image('rgb0', to8b(extras['rgb0'])[tf.newaxis])
-                        tf.contrib.summary.image('disp0', extras['disp0'][tf.newaxis,...,tf.newaxis])
-                        tf.contrib.summary.image('z_std', extras['z_std'][tf.newaxis,...,tf.newaxis])
-        """
+            tqdm.write(
+                f"[TRAIN] Iter: {i} Loss: {loss.item():.4f}  "
+                f"PSNR: {psnr.item():.2f}  "
+                f"Val PSNR: {val_psnr.item():.2f}  "
+                f"SSIM: {val_ssim.item():.4f}  "
+                f"LPIPS: {val_lpips:.4f}"
+            )
 
         global_step += 1
+
+    swanlab.finish()
 
 
 if __name__=='__main__':
